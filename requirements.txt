@@ -1,7 +1,3 @@
-python-telegram-bot
-nest_asyncio
-httpx
-anyio
-certifi
-httpcore
+python-telegram-bot>=20.0
 flask
+aiohttp
