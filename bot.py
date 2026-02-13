@@ -1,6 +1,9 @@
 import logging
 import asyncio
 import os
+import sys
+import fcntl
+import signal
 from threading import Thread
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -13,10 +16,51 @@ from telegram.ext import (
     filters,
     ConversationHandler
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 import aiohttp
 
-# -------------------- Keep-Alive with Self-Ping --------------------
+# ================= SINGLE INSTANCE LOCK =================
+LOCK_FILE = "bot.lock"
+
+def check_single_instance():
+    """Ensure only one bot instance runs at a time using a PID lock file."""
+    try:
+        # Try to open the lock file and acquire an exclusive lock
+        lock_fd = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Write current PID to the file
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        
+        # Keep the file descriptor open to hold the lock
+        # Store it globally so it's not garbage-collected
+        global _lock_fd
+        _lock_fd = lock_fd
+        
+        # Remove lock file on normal exit
+        def release_lock(signum=None, frame=None):
+            try:
+                fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+                _lock_fd.close()
+                os.remove(LOCK_FILE)
+            except:
+                pass
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, release_lock)
+        signal.signal(signal.SIGTERM, release_lock)
+        
+    except (IOError, OSError):
+        # Lock already held – another instance is running
+        print("Another bot instance is already running. Exiting.")
+        sys.exit(1)
+
+# Call the lock check immediately
+check_single_instance()
+# =========================================================
+
+# ================= Keep-Alive with Self-Ping =================
 app = Flask(__name__)
 
 @app.route('/')
@@ -30,7 +74,8 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://applebot-2.onrender.com")  # <-- set your real URL
+# Your Render public URL – set it manually or via env var
+PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://applebotbb.onrender.com")
 
 async def self_ping():
     """Ping public URL every 5 minutes to prevent Render sleep."""
@@ -38,15 +83,16 @@ async def self_ping():
         logging.warning("Self-ping disabled: PUBLIC_URL not set.")
         return
     while True:
-        await asyncio.sleep(300)  # 5 minutes
+        await asyncio.sleep(300)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(PUBLIC_URL, timeout=10) as resp:
                     logging.info(f"Self-ping to {PUBLIC_URL} → {resp.status}")
         except Exception as e:
             logging.error(f"Self-ping failed: {e}")
+# =============================================================
 
-# -------------------- Configuration --------------------
+# ================= CONFIGURATION =================
 BOT_TOKEN = "8511299158:AAHJL-7NTPcc0Dt4rGt3ixHcpOwUGAQ1lQA"
 ADMIN_ID = 7406442919  
 REQUIRED_CHANNEL_ID = "-1001481593780"
@@ -67,7 +113,7 @@ FINAL_IMAGE_URL = "https://i.ibb.co.com/vxfM0vv5/file-00000000f15071fa8c883abb14
 WEBAPP_URL = "https://1xbet-melbet-apple.unaux.com/"
 USER_FILE = "users.txt"
 
-# -------------------- Texts (unchanged) --------------------
+# ================= TEXTS =================
 TEXTS = {
     'en': {
         'choose_platform_caption': "🎮 <b>CHOOSE YOUR PLATFORM</b>\n\nWhich casino do you want to hack? Select below 👇",
@@ -115,11 +161,11 @@ TEXTS = {
     }
 }
 
-# -------------------- States --------------------
+# ================= STATES =================
 CHECK_JOIN, SELECT_LANGUAGE, CHOOSE_PLATFORM, WAITING_FOR_ID = range(4)
 ADMIN_MENU, ADMIN_GET_CONTENT, ADMIN_GET_LINK, ADMIN_GET_BTN_NAME, ADMIN_CONFIRM = range(10, 15)
 
-# -------------------- Logging & Database --------------------
+# ================= LOGGING & DATABASE =================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 def save_user(user_id):
@@ -140,7 +186,7 @@ async def check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest: return False
     except Exception: return False
 
-# -------------------- User Handlers --------------------
+# ================= USER HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id)
@@ -274,7 +320,7 @@ async def receive_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     return ConversationHandler.END
 
-# -------------------- Admin Panel --------------------
+# ================= ADMIN PANEL =================
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     keyboard = [
@@ -367,15 +413,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛔ Cancelled.")
     return ConversationHandler.END
 
-# -------------------- Main Entry Point (FIXED) --------------------
+# ================= MAIN ENTRY POINT =================
 if __name__ == '__main__':
-    # Start Flask dummy server
+    # Start Flask dummy server (keeps Render port open)
     keep_alive()
 
     # Build bot application
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # --- Conversation Handlers (with per_message=False to suppress warnings) ---
+    # --- Conversation Handlers ---
     user_conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -407,18 +453,33 @@ if __name__ == '__main__':
     application.add_handler(admin_conv)
     application.add_handler(user_conv)
 
-    # --- Async main that runs both bot and self-ping ---
+    # --- Async main with conflict handling ---
     async def main():
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-
-        # Start self-ping in the background
+        """Run bot polling and self‑ping concurrently, with retry on Conflict."""
+        # Start self-ping in background
         asyncio.create_task(self_ping())
+
+        # Attempt to start polling, retry if conflict
+        max_retries = 5
+        retry_delay = 10
+        for attempt in range(1, max_retries + 1):
+            try:
+                await application.initialize()
+                await application.start()
+                await application.updater.start_polling()
+                logging.info("Bot polling started successfully.")
+                break  # success
+            except Conflict as e:
+                logging.error(f"Conflict error (attempt {attempt}/{max_retries}): {e}")
+                if attempt == max_retries:
+                    logging.critical("Max retries reached. Exiting.")
+                    sys.exit(1)
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # exponential backoff
 
         # Keep alive forever
         while True:
             await asyncio.sleep(3600)
 
-    # Run the async main function (creates its own event loop)
+    # Run the async main function
     asyncio.run(main())
