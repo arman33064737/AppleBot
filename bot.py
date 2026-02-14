@@ -1,9 +1,6 @@
 import logging
-import asyncio
 import os
 import sys
-import fcntl
-import signal
 from threading import Thread
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -16,83 +13,33 @@ from telegram.ext import (
     filters,
     ConversationHandler
 )
-from telegram.error import BadRequest, Conflict
-import aiohttp
+from telegram.error import BadRequest
 
-# ================= SINGLE INSTANCE LOCK =================
-LOCK_FILE = "bot.lock"
+# ================= লগিং কনফিগারেশন =================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-def check_single_instance():
-    """Ensure only one bot instance runs at a time using a PID lock file."""
-    try:
-        # Try to open the lock file and acquire an exclusive lock
-        lock_fd = open(LOCK_FILE, 'w')
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        
-        # Write current PID to the file
-        lock_fd.write(str(os.getpid()))
-        lock_fd.flush()
-        
-        # Keep the file descriptor open to hold the lock
-        # Store it globally so it's not garbage-collected
-        global _lock_fd
-        _lock_fd = lock_fd
-        
-        # Remove lock file on normal exit
-        def release_lock(signum=None, frame=None):
-            try:
-                fcntl.flock(_lock_fd, fcntl.LOCK_UN)
-                _lock_fd.close()
-                os.remove(LOCK_FILE)
-            except:
-                pass
-            sys.exit(0)
-        
-        signal.signal(signal.SIGINT, release_lock)
-        signal.signal(signal.SIGTERM, release_lock)
-        
-    except (IOError, OSError):
-        # Lock already held – another instance is running
-        print("Another bot instance is already running. Exiting.")
-        sys.exit(1)
-
-# Call the lock check immediately
-check_single_instance()
-# =========================================================
-
-# ================= Keep-Alive with Self-Ping =================
+# ================= ওয়েব সার্ভার (Railway তে পোর্ট অন রাখার জন্য) =================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running successfully!"
+    return "Bot is running 24/7 on Railway!"
 
-def run():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+def run_flask():
+    # রেলওয়ে অটোমেটিক PORT ভেরিয়েবল দেয়, না দিলে 8080 নিবে
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run_flask)
+    t.daemon = True
     t.start()
 
-# Your Render public URL – set it manually or via env var
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://applebotbb.onrender.com")
-
-async def self_ping():
-    """Ping public URL every 5 minutes to prevent Render sleep."""
-    if not PUBLIC_URL:
-        logging.warning("Self-ping disabled: PUBLIC_URL not set.")
-        return
-    while True:
-        await asyncio.sleep(300)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(PUBLIC_URL, timeout=10) as resp:
-                    logging.info(f"Self-ping to {PUBLIC_URL} → {resp.status}")
-        except Exception as e:
-            logging.error(f"Self-ping failed: {e}")
-# =============================================================
-
-# ================= CONFIGURATION =================
+# ================= কনফিগারেশন =================
 BOT_TOKEN = "8511299158:AAHJL-7NTPcc0Dt4rGt3ixHcpOwUGAQ1lQA"
 ADMIN_ID = 7406442919  
 REQUIRED_CHANNEL_ID = "-1001481593780"
@@ -165,9 +112,7 @@ TEXTS = {
 CHECK_JOIN, SELECT_LANGUAGE, CHOOSE_PLATFORM, WAITING_FOR_ID = range(4)
 ADMIN_MENU, ADMIN_GET_CONTENT, ADMIN_GET_LINK, ADMIN_GET_BTN_NAME, ADMIN_CONFIRM = range(10, 15)
 
-# ================= LOGGING & DATABASE =================
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
+# ================= DATABASE FUNC =================
 def save_user(user_id):
     if not os.path.exists(USER_FILE): open(USER_FILE, "w").close()
     with open(USER_FILE, "r") as f: users = f.read().splitlines()
@@ -186,23 +131,16 @@ async def check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest: return False
     except Exception: return False
 
-# ================= USER HANDLERS =================
+# ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id)
-    
     if not await check_membership(update, context):
-        keyboard = [
-            [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_INVITE_LINK)],
-            [InlineKeyboardButton("✅ I Have Joined", callback_data='check_join_status')]
-        ]
+        keyboard = [[InlineKeyboardButton("📢 Join Channel", url=CHANNEL_INVITE_LINK)], [InlineKeyboardButton("✅ I Have Joined", callback_data='check_join_status')]]
         welcome_text = f"👋 <b>Hello {user.first_name}!</b>\nJoin our channel to use this bot."
-        try:
-            await update.message.reply_photo(photo=IMG_START, caption=welcome_text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
-        except:
-            await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        try: await update.message.reply_photo(photo=IMG_START, caption=welcome_text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        except: await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
         return CHECK_JOIN
-    
     await show_language_menu(update, context)
     return SELECT_LANGUAGE
 
@@ -217,15 +155,10 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return CHECK_JOIN
 
 async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🇺🇸 English", callback_data='lang_en'),
-         InlineKeyboardButton("🇧🇩 বাংলা", callback_data='lang_bn')]
-    ]
+    keyboard = [[InlineKeyboardButton("🇺🇸 English", callback_data='lang_en'), InlineKeyboardButton("🇧🇩 বাংলা", callback_data='lang_bn')]]
     text = "🌐 <b>Select Language / ভাষা নির্বাচন করুন:</b>"
     if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        await query.message.delete()
+        await update.callback_query.message.delete()
         await context.bot.send_photo(chat_id=update.effective_chat.id, photo=IMG_LANG, caption=text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await update.effective_chat.send_photo(photo=IMG_LANG, caption=text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
@@ -242,15 +175,9 @@ async def show_platform_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     lang = context.user_data.get('lang', 'en')
     t = TEXTS[lang]
-    keyboard = [
-        [InlineKeyboardButton("🔵 1XBET", callback_data='platform_1xbet'),
-         InlineKeyboardButton("🟡 MELBET", callback_data='platform_melbet')],
-        [InlineKeyboardButton(t['btn_help'], url=ADMIN_USER_LINK)]
-    ]
+    keyboard = [[InlineKeyboardButton("🔵 1XBET", callback_data='platform_1xbet'), InlineKeyboardButton("🟡 MELBET", callback_data='platform_melbet')], [InlineKeyboardButton(t['btn_help'], url=ADMIN_USER_LINK)]]
     await query.message.delete()
-    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=IMG_CHOOSE_PLATFORM,
-                                 caption=t['choose_platform_caption'], parse_mode='HTML',
-                                 reply_markup=InlineKeyboardMarkup(keyboard))
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=IMG_CHOOSE_PLATFORM, caption=t['choose_platform_caption'], parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def platform_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -259,18 +186,10 @@ async def platform_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = context.user_data.get('lang', 'en')
     t = TEXTS[lang]
     p_name = "1XBET" if choice == 'platform_1xbet' else "MELBET"
-    
     text = f"{t['reg_title'].format(platform=p_name)}\n\n{t['reg_msg'].format(promo=PROMO_CODE)}"
-    
-    keyboard = [
-        [InlineKeyboardButton(t['btn_reg_link'].format(platform=p_name), url=LINK_REGISTRATION)],
-        [InlineKeyboardButton(t['btn_next'], callback_data='account_created')],
-        [InlineKeyboardButton(t['btn_contact'], url=ADMIN_USER_LINK)]
-    ]
-    
+    keyboard = [[InlineKeyboardButton(t['btn_reg_link'].format(platform=p_name), url=LINK_REGISTRATION)], [InlineKeyboardButton(t['btn_next'], callback_data='account_created')], [InlineKeyboardButton(t['btn_contact'], url=ADMIN_USER_LINK)]]
     await query.message.delete()
-    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=IMG_REGISTRATION,
-                                 caption=text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=IMG_REGISTRATION, caption=text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_PLATFORM
 
 async def wait_and_ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,11 +197,10 @@ async def wait_and_ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     lang = context.user_data.get('lang', 'en')
     msg = await query.message.reply_text(TEXTS[lang]['wait_msg'], parse_mode='HTML')
+    import asyncio
     await asyncio.sleep(4)
-    try:
-        await msg.delete()
-    except:
-        pass
+    try: await msg.delete()
+    except: pass
     await query.message.reply_text(TEXTS[lang]['ask_id'], parse_mode='HTML')
     return WAITING_FOR_ID
 
@@ -290,46 +208,23 @@ async def receive_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.text.strip()
     lang = context.user_data.get('lang', 'en')
     t = TEXTS[lang]
-    
-    if not uid.isdigit():
+    if not uid.isdigit(): 
         await update.message.reply_text(t['error_digit'], parse_mode='HTML')
         return WAITING_FOR_ID
-    
-    if len(uid) < 9 or len(uid) > 10:
+    if len(uid) < 9 or len(uid) > 10: 
         await update.message.reply_text(t['error_length'], parse_mode='HTML')
         return WAITING_FOR_ID
-    
-    keyboard = [
-        [InlineKeyboardButton(t['btn_open_hack'], web_app=WebAppInfo(url=WEBAPP_URL))],
-        [InlineKeyboardButton(t['btn_contact'], url=ADMIN_USER_LINK)]
-    ]
-    
-    try:
-        await update.message.reply_photo(
-            photo=FINAL_IMAGE_URL,
-            caption=t['success_caption'].format(uid=uid, promo=PROMO_CODE),
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    keyboard = [[InlineKeyboardButton(t['btn_open_hack'], web_app=WebAppInfo(url=WEBAPP_URL))], [InlineKeyboardButton(t['btn_contact'], url=ADMIN_USER_LINK)]]
+    try: await update.message.reply_photo(photo=FINAL_IMAGE_URL, caption=t['success_caption'].format(uid=uid, promo=PROMO_CODE), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     except BadRequest:
         keyboard = [[InlineKeyboardButton(t['btn_open_hack'].replace("(WebApp)", "(Link)"), url=WEBAPP_URL)]]
-        await update.message.reply_text(
-            f"✅ Verified ID: {uid}\n⬇️ Open Hack:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
+        await update.message.reply_text(f"✅ Verified ID: {uid}\n⬇️ Open Hack:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ================= ADMIN PANEL =================
+# ================= ADMIN HANDLERS =================
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    keyboard = [
-        [InlineKeyboardButton("📸 Photo + Text", callback_data='mode_photo_text')],
-        [InlineKeyboardButton("🎥 Video + Text + Btn", callback_data='mode_video_text_btn')],
-        [InlineKeyboardButton("🎥 Video + Btn", callback_data='mode_video_btn')],
-        [InlineKeyboardButton("📝 Text + Btn", callback_data='mode_text_btn')],
-        [InlineKeyboardButton("❌ Cancel", callback_data='admin_cancel')]
-    ]
+    keyboard = [[InlineKeyboardButton("📸 Photo + Text", callback_data='mode_photo_text')], [InlineKeyboardButton("🎥 Video + Text + Btn", callback_data='mode_video_text_btn')], [InlineKeyboardButton("🎥 Video + Btn", callback_data='mode_video_btn')], [InlineKeyboardButton("📝 Text + Btn", callback_data='mode_text_btn')], [InlineKeyboardButton("❌ Cancel", callback_data='admin_cancel')]]
     await update.message.reply_text("👑 <b>ADMIN PANEL</b>", parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     return ADMIN_MENU
 
@@ -357,7 +252,6 @@ async def admin_get_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Invalid Format!")
         return ADMIN_GET_CONTENT
-
     if 'btn' in mode:
         await update.message.reply_text("🔗 Enter Button URL:", parse_mode='HTML')
         return ADMIN_GET_LINK
@@ -373,10 +267,7 @@ async def admin_get_btn_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return await admin_broadcast_confirm(update, context)
 
 async def admin_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🚀 SEND", callback_data='confirm_send'),
-         InlineKeyboardButton("❌ CANCEL", callback_data='confirm_cancel')]
-    ]
+    keyboard = [[InlineKeyboardButton("🚀 SEND", callback_data='confirm_send'), InlineKeyboardButton("❌ CANCEL", callback_data='confirm_cancel')]]
     await update.message.reply_text("✅ Confirm Send?", reply_markup=InlineKeyboardMarkup(keyboard))
     return ADMIN_CONFIRM
 
@@ -386,26 +277,20 @@ async def admin_perform_broadcast(update: Update, context: ContextTypes.DEFAULT_
     if query.data == 'confirm_cancel':
         await query.message.edit_text("❌ Cancelled.")
         return ConversationHandler.END
-    
     users = get_users()
     await query.message.edit_text(f"🚀 Sending to {len(users)} users...")
     mode = context.user_data['bc_mode']
     markup = InlineKeyboardMarkup([[InlineKeyboardButton(context.user_data['btn_name'], url=context.user_data['btn_url'])]]) if 'btn' in mode else None
-    
     count = 0
+    import asyncio
     for uid in users:
         try:
-            if 'photo' in mode:
-                await context.bot.send_photo(uid, photo=context.user_data['file_id'], caption=context.user_data['caption'])
-            elif 'video' in mode:
-                await context.bot.send_video(uid, video=context.user_data['file_id'], caption=context.user_data.get('caption'), reply_markup=markup)
-            elif 'text' in mode:
-                await context.bot.send_message(uid, text=context.user_data['text'], reply_markup=markup)
+            if 'photo' in mode: await context.bot.send_photo(uid, photo=context.user_data['file_id'], caption=context.user_data['caption'])
+            elif 'video' in mode: await context.bot.send_video(uid, video=context.user_data['file_id'], caption=context.user_data.get('caption'), reply_markup=markup)
+            elif 'text' in mode: await context.bot.send_message(uid, text=context.user_data['text'], reply_markup=markup)
             count += 1
             await asyncio.sleep(0.05)
-        except Exception:
-            pass
-            
+        except Exception: pass
     await context.bot.send_message(chat_id=update.effective_chat.id, text=f"✅ Sent to {count} users.")
     return ConversationHandler.END
 
@@ -413,30 +298,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛔ Cancelled.")
     return ConversationHandler.END
 
-# ================= MAIN ENTRY POINT =================
+# ================= MAIN =================
 if __name__ == '__main__':
-    # Start Flask dummy server (keeps Render port open)
+    # 1. Start Flask in Background Thread (For Railway)
     keep_alive()
 
-    # Build bot application
+    # 2. Build the Bot
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # --- Conversation Handlers ---
+    # 3. Add Handlers
     user_conv = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
             CHECK_JOIN: [CallbackQueryHandler(check_join_callback, pattern='^check_join_status$')],
             SELECT_LANGUAGE: [CallbackQueryHandler(set_language, pattern='^lang_')],
-            CHOOSE_PLATFORM: [
-                CallbackQueryHandler(platform_choice, pattern='^platform_'),
-                CallbackQueryHandler(wait_and_ask_id, pattern='^account_created$')
-            ],
+            CHOOSE_PLATFORM: [CallbackQueryHandler(platform_choice, pattern='^platform_'), CallbackQueryHandler(wait_and_ask_id, pattern='^account_created$')],
             WAITING_FOR_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_id)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
         per_message=False
     )
-
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler('admin', admin_start)],
         states={
@@ -453,33 +334,7 @@ if __name__ == '__main__':
     application.add_handler(admin_conv)
     application.add_handler(user_conv)
 
-    # --- Async main with conflict handling ---
-    async def main():
-        """Run bot polling and self‑ping concurrently, with retry on Conflict."""
-        # Start self-ping in background
-        asyncio.create_task(self_ping())
-
-        # Attempt to start polling, retry if conflict
-        max_retries = 5
-        retry_delay = 10
-        for attempt in range(1, max_retries + 1):
-            try:
-                await application.initialize()
-                await application.start()
-                await application.updater.start_polling()
-                logging.info("Bot polling started successfully.")
-                break  # success
-            except Conflict as e:
-                logging.error(f"Conflict error (attempt {attempt}/{max_retries}): {e}")
-                if attempt == max_retries:
-                    logging.critical("Max retries reached. Exiting.")
-                    sys.exit(1)
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # exponential backoff
-
-        # Keep alive forever
-        while True:
-            await asyncio.sleep(3600)
-
-    # Run the async main function
-    asyncio.run(main())
+    # 4. Run Polling (Blocking, Keeps Main Thread Alive)
+    print("Bot is running...")
+    # application.run_polling() হলো v20+ এর জন্য স্ট্যান্ডার্ড মেথড যা অটোমেটিক সিগন্যাল হ্যান্ডেল করে
+    application.run_polling()
