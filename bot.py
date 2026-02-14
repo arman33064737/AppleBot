@@ -40,7 +40,7 @@ def keep_alive():
     t.start()
 
 # ================= কনফিগারেশন =================
-BOT_TOKEN = "8511299158:AAHJL-7NTPcc0Dt4rGt3ixHcpOwUGAQ1lQA"
+BOT_TOKEN = "8511299158:AAF4pBjTYUzE0DgghQDjHdNlHe1d71IoSeQ"
 ADMIN_ID = 7406442919  
 REQUIRED_CHANNEL_ID = "-1001481593780"
 
